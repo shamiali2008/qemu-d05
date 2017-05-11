@@ -110,6 +110,10 @@ static ARMPlatformBusSystemParams platform_bus_params;
 #define RAMLIMIT_GB 255
 #define RAMLIMIT_BYTES (RAMLIMIT_GB * 1024ULL * 1024 * 1024)
 
+QLIST_HEAD(resv_addr_head, VirtMemRegion) resv_address_regions;
+struct resv_addr_head resv_address_regions =
+                  QLIST_HEAD_INITIALIZER(resv_address_regions);
+
 /* Addresses and sizes of our components.
  * 0..128MB is space for a flash device so we can run bootrom code such as UEFI.
  * 128MB..256MB is used for miscellaneous device I/O.
@@ -1147,6 +1151,135 @@ static void create_secure_ram(VirtMachineState *vms,
     g_free(nodename);
 }
 
+static void create_ram_alias(VirtMachineState *vms,
+                             MemoryRegion *sysmem,
+                             MemoryRegion *ram)
+{
+    VirtMemRegion *reg;
+    MemoryRegion  *mem;
+    char mstr[50];
+    hwaddr sz = 0;
+    int i = 0;
+
+    QLIST_FOREACH(reg, &vms->mem_list, next) {
+        snprintf(mstr, sizeof(mstr), "resv%d", i++);
+        mem = g_new(MemoryRegion, 1);
+        memory_region_init_alias(mem, NULL, mstr, ram, sz, reg->size);
+        memory_region_add_subregion(sysmem, reg->base, mem);
+        sz += reg->size;
+    }
+}
+
+static void update_resv_regions(hwaddr addr, hwaddr size)
+{
+    VirtMemRegion *reg, *next_reg, *new;
+
+    new = g_new(VirtMemRegion, 1);
+    new->base = addr;
+    new->size = size;
+
+    if (QLIST_EMPTY(&resv_address_regions)) {
+        QLIST_INSERT_HEAD(&resv_address_regions, new, next);
+        return;
+    }
+
+    reg = QLIST_FIRST(&resv_address_regions);
+    if (addr < reg->base) {
+        QLIST_INSERT_HEAD(&resv_address_regions, new, next);
+        return;
+    }
+
+    QLIST_FOREACH(reg, &resv_address_regions, next) {
+        next_reg = QLIST_NEXT(reg, next);
+        if (reg->base == addr) {
+            g_free(new);
+            return;
+        } else if (!next_reg || next_reg->base > addr) {
+            QLIST_INSERT_AFTER(reg, new, next);
+            return;
+        }
+    }
+}
+
+/* ToDo: Check for all corner cases */
+static void update_memory_regions(VirtMachineState *vms, hwaddr virt_sz)
+{
+
+    VirtMemRegion *new, *reg, *last = NULL;
+    hwaddr virt_start, virt_end;
+
+    virt_start = vms->memmap[VIRT_MEM].base;
+    virt_end = virt_start + virt_sz - 1;
+
+    QLIST_FOREACH(reg, &resv_address_regions, next) {
+        if ((reg->base >= virt_start) && (reg->base < virt_end)) {
+
+            new = g_new(VirtMemRegion, 1);
+            if (reg->base == virt_start) {
+                new->base = virt_start + reg->size;
+                new->size = virt_sz;
+                virt_start = new->base + virt_sz;
+            } else {
+                new->base = virt_start;
+                new->size = reg->base - virt_start;
+                virt_start = reg->base + reg->size;
+            }
+
+            if (QLIST_EMPTY(&vms->mem_list)) {
+                QLIST_INSERT_HEAD(&vms->mem_list, new, next);
+            } else {
+                QLIST_INSERT_AFTER(last, new, next);
+            }
+
+            last = new;
+            virt_sz -= new->size;
+        }
+    }
+
+    if (virt_sz > 0) {
+        new = malloc(sizeof(*new));
+        new->base = virt_start;
+        new->size = virt_sz;
+
+        if (QLIST_EMPTY(&vms->mem_list)) {
+            QLIST_INSERT_HEAD(&vms->mem_list, new, next);
+        } else {
+            QLIST_INSERT_AFTER(last, new, next);
+        }
+    }
+}
+
+static void populate_ram_regions(VirtMachineState *vms,
+                                    MemoryRegion *sysmem,
+                                    MemoryRegion *ram,
+                                    hwaddr ram_size)
+{
+    char fd_path[50];
+    FILE *fd;
+    hwaddr start, end;
+    char str[10];
+    int i = 0;
+
+    /* Check for any reserved_regions */
+    while (true) {
+        snprintf(fd_path, sizeof(fd_path),
+                "/sys/kernel/iommu_groups/%d/reserved_regions", i++);
+        fd = fopen(fd_path, "r");
+        if (!fd) {
+            break;
+        }
+
+        while (fscanf(fd, "%"PRIx64" %"PRIx64" %s", &start, &end, str) != EOF) {
+            update_resv_regions(start, (end - start + 1));
+        }
+
+        fclose(fd);
+    };
+
+    update_memory_regions(vms, ram_size);
+    create_ram_alias(vms, sysmem, ram);
+}
+
 static void *machvirt_dtb(const struct arm_boot_info *binfo, int *fdt_size)
 {
     const VirtMachineState *board = container_of(binfo, VirtMachineState,
@@ -1211,6 +1344,7 @@ static void machvirt_init(MachineState *machine)
     Error *err = NULL;
     bool firmware_loaded = bios_name || drive_get(IF_PFLASH, 0, 0);
     uint8_t clustersz;
+    VirtMemRegion *mem_reg;
 
     if (!cpu_model) {
         cpu_model = "cortex-a15";
@@ -1385,7 +1519,7 @@ static void machvirt_init(MachineState *machine)
 
     memory_region_allocate_system_memory(ram, NULL, "mach-virt.ram",
                                          machine->ram_size);
-    memory_region_add_subregion(sysmem, vms->memmap[VIRT_MEM].base, ram);
+    populate_ram_regions(vms, sysmem, ram, machine->ram_size);
 
     create_flash(vms, sysmem, secure_sysmem ? secure_sysmem : sysmem);
 
@@ -1418,13 +1552,16 @@ static void machvirt_init(MachineState *machine)
     vms->machine_done.notify = virt_machine_done;
     qemu_add_machine_init_done_notifier(&vms->machine_done);
 
+    /* ToDo: Check we will have atleast one entry in mem_list */
+    mem_reg = QLIST_FIRST(&vms->mem_list);
+
     vms->bootinfo.ram_size = machine->ram_size;
     vms->bootinfo.kernel_filename = machine->kernel_filename;
     vms->bootinfo.kernel_cmdline = machine->kernel_cmdline;
     vms->bootinfo.initrd_filename = machine->initrd_filename;
     vms->bootinfo.nb_cpus = smp_cpus;
     vms->bootinfo.board_id = -1;
-    vms->bootinfo.loader_start = vms->memmap[VIRT_MEM].base;
+    vms->bootinfo.loader_start = mem_reg->base;
     vms->bootinfo.get_dtb = machvirt_dtb;
     vms->bootinfo.firmware_loaded = firmware_loaded;
     arm_load_kernel(ARM_CPU(first_cpu), &vms->bootinfo);

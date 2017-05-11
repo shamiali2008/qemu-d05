@@ -13,6 +13,7 @@
 #include "hw/hw.h"
 #include "hw/arm/arm.h"
 #include "hw/arm/linux-boot-if.h"
+#include "hw/arm/virt.h"
 #include "sysemu/kvm.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/numa.h"
@@ -490,24 +491,28 @@ static int load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
             g_free(nodename);
         }
     } else {
-        Error *err = NULL;
+        VirtMachineState *vms = VIRT_MACHINE(qdev_get_machine());
+        VirtMemRegion *reg;
 
-        rc = fdt_path_offset(fdt, "/memory");
-        if (rc < 0) {
-            qemu_fdt_add_subnode(fdt, "/memory");
-        }
+        qemu_fdt_nop_node(fdt, "/memory");
 
-        if (!qemu_fdt_getprop(fdt, "/memory", "device_type", NULL, &err)) {
-            qemu_fdt_setprop_string(fdt, "/memory", "device_type", "memory");
-        }
-
-        rc = qemu_fdt_setprop_sized_cells(fdt, "/memory", "reg",
-                                          acells, binfo->loader_start,
-                                          scells, binfo->ram_size);
-        if (rc < 0) {
-            fprintf(stderr, "couldn't set /memory/reg\n");
-            goto fail;
-        }
+        QLIST_FOREACH(reg, &vms->mem_list, next) {
+            printf("dtb: Mem list: Addr 0x%"PRIx64", size 0x%"PRIx64"\n",
+                                                   reg->base, reg->size);
+            mem_base = reg->base;
+            mem_len = reg->size;
+            nodename = g_strdup_printf("/memory@%" PRIx64, mem_base);
+            qemu_fdt_add_subnode(fdt, nodename);
+            qemu_fdt_setprop_string(fdt, nodename, "device_type", "memory");
+            rc = qemu_fdt_setprop_sized_cells(fdt, nodename, "reg",
+                                          acells, mem_base,
+                                          scells, mem_len);
+            if (rc < 0) {
+                fprintf(stderr, "couldn't set %s\n", nodename);
+                goto fail;
+            }
+            g_free(nodename);
+         }
     }
 
     rc = fdt_path_offset(fdt, "/chosen");

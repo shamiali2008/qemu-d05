@@ -87,6 +87,12 @@ typedef struct {
     bool claim_edge_triggered_timers;
 } VirtMachineClass;
 
+typedef struct VirtMemRegion {
+    hwaddr base;
+    hwaddr size;
+    QLIST_ENTRY(VirtMemRegion) next;
+} VirtMemRegion;
+
 typedef struct {
     MachineState parent;
     Notifier machine_done;
@@ -106,6 +112,7 @@ typedef struct {
     uint32_t gic_phandle;
     uint32_t msi_phandle;
     int psci_conduit;
+    QLIST_HEAD(, VirtMemRegion) mem_list;
 } VirtMachineState;
 
 #define TYPE_VIRT_MACHINE   MACHINE_TYPE_NAME("virt")
